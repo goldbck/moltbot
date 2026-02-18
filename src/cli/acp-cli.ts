@@ -1,10 +1,10 @@
 import type { Command } from "commander";
-
 import { runAcpClientInteractive } from "../acp/client.js";
 import { serveAcpGateway } from "../acp/server.js";
 import { defaultRuntime } from "../runtime.js";
 import { formatDocsLink } from "../terminal/links.js";
 import { theme } from "../terminal/theme.js";
+import { inheritOptionFromParent } from "./command-options.js";
 
 export function registerAcpCli(program: Command) {
   const acp = program.command("acp").description("Run an ACP bridge backed by the Gateway");
@@ -21,11 +21,11 @@ export function registerAcpCli(program: Command) {
     .option("--verbose, -v", "Verbose logging to stderr", false)
     .addHelpText(
       "after",
-      () => `\n${theme.muted("Docs:")} ${formatDocsLink("/cli/acp", "docs.molt.bot/cli/acp")}\n`,
+      () => `\n${theme.muted("Docs:")} ${formatDocsLink("/cli/acp", "docs.openclaw.ai/cli/acp")}\n`,
     )
-    .action((opts) => {
+    .action(async (opts) => {
       try {
-        serveAcpGateway({
+        await serveAcpGateway({
           gatewayUrl: opts.url as string | undefined,
           gatewayToken: opts.token as string | undefined,
           gatewayPassword: opts.password as string | undefined,
@@ -46,18 +46,19 @@ export function registerAcpCli(program: Command) {
     .command("client")
     .description("Run an interactive ACP client against the local ACP bridge")
     .option("--cwd <dir>", "Working directory for the ACP session")
-    .option("--server <command>", "ACP server command (default: moltbot)")
+    .option("--server <command>", "ACP server command (default: openclaw)")
     .option("--server-args <args...>", "Extra arguments for the ACP server")
     .option("--server-verbose", "Enable verbose logging on the ACP server", false)
     .option("--verbose, -v", "Verbose client logging", false)
-    .action(async (opts) => {
+    .action(async (opts, command) => {
+      const inheritedVerbose = inheritOptionFromParent<boolean>(command, "verbose");
       try {
         await runAcpClientInteractive({
           cwd: opts.cwd as string | undefined,
           serverCommand: opts.server as string | undefined,
           serverArgs: opts.serverArgs as string[] | undefined,
           serverVerbose: Boolean(opts.serverVerbose),
-          verbose: Boolean(opts.verbose),
+          verbose: Boolean(opts.verbose || inheritedVerbose),
         });
       } catch (err) {
         defaultRuntime.error(String(err));
