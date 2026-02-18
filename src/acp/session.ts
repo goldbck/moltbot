@@ -1,8 +1,13 @@
 import { randomUUID } from "node:crypto";
+
 import type { AcpSession } from "./types.js";
 
 export type AcpSessionStore = {
-  createSession: (params: { sessionKey: string; cwd: string; sessionId?: string }) => AcpSession;
+  createSession: (params: {
+    sessionKey: string;
+    cwd: string;
+    sessionId?: string;
+  }) => AcpSession;
   getSession: (sessionId: string) => AcpSession | undefined;
   getSessionByRunId: (runId: string) => AcpSession | undefined;
   setActiveRun: (sessionId: string, runId: string, abortController: AbortController) => void;
@@ -36,11 +41,13 @@ export function createInMemorySessionStore(): AcpSessionStore {
     return sessionId ? sessions.get(sessionId) : undefined;
   };
 
-  const setActiveRun: AcpSessionStore["setActiveRun"] = (sessionId, runId, abortController) => {
+  const setActiveRun: AcpSessionStore["setActiveRun"] = (
+    sessionId,
+    runId,
+    abortController,
+  ) => {
     const session = sessions.get(sessionId);
-    if (!session) {
-      return;
-    }
+    if (!session) return;
     session.activeRunId = runId;
     session.abortController = abortController;
     runIdToSessionId.set(runId, sessionId);
@@ -48,25 +55,17 @@ export function createInMemorySessionStore(): AcpSessionStore {
 
   const clearActiveRun: AcpSessionStore["clearActiveRun"] = (sessionId) => {
     const session = sessions.get(sessionId);
-    if (!session) {
-      return;
-    }
-    if (session.activeRunId) {
-      runIdToSessionId.delete(session.activeRunId);
-    }
+    if (!session) return;
+    if (session.activeRunId) runIdToSessionId.delete(session.activeRunId);
     session.activeRunId = null;
     session.abortController = null;
   };
 
   const cancelActiveRun: AcpSessionStore["cancelActiveRun"] = (sessionId) => {
     const session = sessions.get(sessionId);
-    if (!session?.abortController) {
-      return false;
-    }
+    if (!session?.abortController) return false;
     session.abortController.abort();
-    if (session.activeRunId) {
-      runIdToSessionId.delete(session.activeRunId);
-    }
+    if (session.activeRunId) runIdToSessionId.delete(session.activeRunId);
     session.abortController = null;
     session.activeRunId = null;
     return true;

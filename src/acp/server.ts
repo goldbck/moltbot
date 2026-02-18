@@ -1,17 +1,22 @@
 #!/usr/bin/env node
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
+
 import { AgentSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
+
 import { loadConfig } from "../config/config.js";
 import { resolveGatewayAuth } from "../gateway/auth.js";
 import { buildGatewayConnectionDetails } from "../gateway/call.js";
 import { GatewayClient } from "../gateway/client.js";
 import { isMainModule } from "../infra/is-main.js";
-import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../utils/message-channel.js";
 import { AcpGatewayAgent } from "./translator.js";
 import type { AcpServerOptions } from "./types.js";
 
-export function serveAcpGateway(opts: AcpServerOptions = {}): Promise<void> {
+export function serveAcpGateway(opts: AcpServerOptions = {}): void {
   const cfg = loadConfig();
   const connection = buildGatewayConnectionDetails({
     config: cfg,
@@ -25,21 +30,15 @@ export function serveAcpGateway(opts: AcpServerOptions = {}): Promise<void> {
   const token =
     opts.gatewayToken ??
     (isRemoteMode ? remote?.token?.trim() : undefined) ??
-    process.env.OPENCLAW_GATEWAY_TOKEN ??
+    process.env.CLAWDBOT_GATEWAY_TOKEN ??
     auth.token;
   const password =
     opts.gatewayPassword ??
     (isRemoteMode ? remote?.password?.trim() : undefined) ??
-    process.env.OPENCLAW_GATEWAY_PASSWORD ??
+    process.env.CLAWDBOT_GATEWAY_PASSWORD ??
     auth.password;
 
   let agent: AcpGatewayAgent | null = null;
-  let onClosed!: () => void;
-  const closed = new Promise<void>((resolve) => {
-    onClosed = resolve;
-  });
-  let stopped = false;
-
   const gateway = new GatewayClient({
     url: connection.url,
     token: token || undefined,
@@ -56,41 +55,20 @@ export function serveAcpGateway(opts: AcpServerOptions = {}): Promise<void> {
     },
     onClose: (code, reason) => {
       agent?.handleGatewayDisconnect(`${code}: ${reason}`);
-      // Resolve only on intentional shutdown (gateway.stop() sets closed
-      // which skips scheduleReconnect, then fires onClose).  Transient
-      // disconnects are followed by automatic reconnect attempts.
-      if (stopped) {
-        onClosed();
-      }
     },
   });
 
-  const shutdown = () => {
-    if (stopped) {
-      return;
-    }
-    stopped = true;
-    gateway.stop();
-    // If no WebSocket is active (e.g. between reconnect attempts),
-    // gateway.stop() won't trigger onClose, so resolve directly.
-    onClosed();
-  };
-
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
-
   const input = Writable.toWeb(process.stdout);
-  const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
+  const output = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
   const stream = ndJsonStream(input, output);
 
-  new AgentSideConnection((conn: AgentSideConnection) => {
+  new AgentSideConnection((conn) => {
     agent = new AcpGatewayAgent(conn, gateway, opts);
     agent.start();
     return agent;
   }, stream);
 
   gateway.start();
-  return closed;
 }
 
 function parseArgs(args: string[]): AcpServerOptions {
@@ -147,7 +125,7 @@ function parseArgs(args: string[]): AcpServerOptions {
 }
 
 function printHelp(): void {
-  console.log(`Usage: openclaw acp [options]
+  console.log(`Usage: clawdbot acp [options]
 
 Gateway-backed ACP server for IDE integration.
 
@@ -167,8 +145,5 @@ Options:
 
 if (isMainModule({ currentFile: fileURLToPath(import.meta.url) })) {
   const opts = parseArgs(process.argv.slice(2));
-  serveAcpGateway(opts).catch((err) => {
-    console.error(String(err));
-    process.exit(1);
-  });
+  serveAcpGateway(opts);
 }
