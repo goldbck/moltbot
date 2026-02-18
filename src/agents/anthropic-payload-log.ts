@@ -1,13 +1,16 @@
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
 import path from "node:path";
+
 import type { AgentMessage, StreamFn } from "@mariozechner/pi-agent-core";
 import type { Api, Model } from "@mariozechner/pi-ai";
+
+import type { ClawdbotConfig } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
-import { createSubsystemLogger } from "../logging/subsystem.js";
-import { resolveUserPath } from "../utils.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { parseBooleanValue } from "../utils/boolean.js";
-import { safeJsonStringify } from "../utils/safe-json.js";
-import { getQueuedFileWriter, type QueuedFileWriter } from "./queued-file-writer.js";
+import { resolveUserPath } from "../utils.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 
 type PayloadLogStage = "request" | "usage";
 
@@ -32,14 +35,25 @@ type PayloadLogConfig = {
   filePath: string;
 };
 
-type PayloadLogWriter = QueuedFileWriter;
+type PayloadLogInit = {
+  cfg?: ClawdbotConfig;
+  env?: NodeJS.ProcessEnv;
+};
+
+type PayloadLogWriter = {
+  filePath: string;
+  write: (line: string) => void;
+};
 
 const writers = new Map<string, PayloadLogWriter>();
 const log = createSubsystemLogger("agent/anthropic-payload");
 
-function resolvePayloadLogConfig(env: NodeJS.ProcessEnv): PayloadLogConfig {
-  const enabled = parseBooleanValue(env.OPENCLAW_ANTHROPIC_PAYLOAD_LOG) ?? false;
-  const fileOverride = env.OPENCLAW_ANTHROPIC_PAYLOAD_LOG_FILE?.trim();
+function resolvePayloadLogConfig(params: PayloadLogInit): PayloadLogConfig {
+  const env = params.env ?? process.env;
+  const config = params.cfg?.diagnostics?.anthropicPayloadLog;
+  const envEnabled = parseBooleanValue(env.CLAWDBOT_ANTHROPIC_PAYLOAD_LOG);
+  const enabled = envEnabled ?? config?.enabled ?? false;
+  const fileOverride = config?.filePath?.trim() || env.CLAWDBOT_ANTHROPIC_PAYLOAD_LOG_FILE?.trim();
   const filePath = fileOverride
     ? resolveUserPath(fileOverride)
     : path.join(resolveStateDir(env), "logs", "anthropic-payload.jsonl");
@@ -47,30 +61,48 @@ function resolvePayloadLogConfig(env: NodeJS.ProcessEnv): PayloadLogConfig {
 }
 
 function getWriter(filePath: string): PayloadLogWriter {
-  return getQueuedFileWriter(writers, filePath);
+  const existing = writers.get(filePath);
+  if (existing) return existing;
+
+  const dir = path.dirname(filePath);
+  const ready = fs.mkdir(dir, { recursive: true }).catch(() => undefined);
+  let queue = Promise.resolve();
+
+  const writer: PayloadLogWriter = {
+    filePath,
+    write: (line: string) => {
+      queue = queue
+        .then(() => ready)
+        .then(() => fs.appendFile(filePath, line, "utf8"))
+        .catch(() => undefined);
+    },
+  };
+
+  writers.set(filePath, writer);
+  return writer;
 }
 
-function formatError(error: unknown): string | undefined {
-  if (error instanceof Error) {
-    return error.message;
+function safeJsonStringify(value: unknown): string | null {
+  try {
+    return JSON.stringify(value, (_key, val) => {
+      if (typeof val === "bigint") return val.toString();
+      if (typeof val === "function") return "[Function]";
+      if (val instanceof Error) {
+        return { name: val.name, message: val.message, stack: val.stack };
+      }
+      if (val instanceof Uint8Array) {
+        return { type: "Uint8Array", data: Buffer.from(val).toString("base64") };
+      }
+      return val;
+    });
+  } catch {
+    return null;
   }
-  if (typeof error === "string") {
-    return error;
-  }
-  if (typeof error === "number" || typeof error === "boolean" || typeof error === "bigint") {
-    return String(error);
-  }
-  if (error && typeof error === "object") {
-    return safeJsonStringify(error) ?? "unknown error";
-  }
-  return undefined;
 }
 
 function digest(value: unknown): string | undefined {
   const serialized = safeJsonStringify(value);
-  if (!serialized) {
-    return undefined;
-  }
+  if (!serialized) return undefined;
   return crypto.createHash("sha256").update(serialized).digest("hex");
 }
 
@@ -78,8 +110,12 @@ function isAnthropicModel(model: Model<Api> | undefined | null): boolean {
   return (model as { api?: unknown })?.api === "anthropic-messages";
 }
 
-function findLastAssistantUsage(messages: AgentMessage[]): Record<string, unknown> | null {
+function findLastAssistantUsage(
+  messages: AgentMessage[],
+  minIndex = 0,
+): Record<string, unknown> | null {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (i < minIndex) break;
     const msg = messages[i] as { role?: unknown; usage?: unknown };
     if (msg?.role === "assistant" && msg.usage && typeof msg.usage === "object") {
       return msg.usage as Record<string, unknown>;
@@ -90,11 +126,13 @@ function findLastAssistantUsage(messages: AgentMessage[]): Record<string, unknow
 
 export type AnthropicPayloadLogger = {
   enabled: true;
+  filePath: string;
   wrapStreamFn: (streamFn: StreamFn) => StreamFn;
-  recordUsage: (messages: AgentMessage[], error?: unknown) => void;
+  recordUsage: (messages: AgentMessage[], error?: unknown, baselineMessageCount?: number) => void;
 };
 
 export function createAnthropicPayloadLogger(params: {
+  cfg?: ClawdbotConfig;
   env?: NodeJS.ProcessEnv;
   runId?: string;
   sessionId?: string;
@@ -103,14 +141,14 @@ export function createAnthropicPayloadLogger(params: {
   modelId?: string;
   modelApi?: string | null;
   workspaceDir?: string;
+  writer?: PayloadLogWriter;
 }): AnthropicPayloadLogger | null {
   const env = params.env ?? process.env;
-  const cfg = resolvePayloadLogConfig(env);
-  if (!cfg.enabled) {
-    return null;
-  }
+  const cfg = resolvePayloadLogConfig({ env, cfg: params.cfg });
+  if (!cfg.enabled) return null;
+  if (params.modelApi !== "anthropic-messages") return null;
 
-  const writer = getWriter(cfg.filePath);
+  const writer = params.writer ?? getWriter(cfg.filePath);
   const base: Omit<PayloadLogEvent, "ts" | "stage"> = {
     runId: params.runId,
     sessionId: params.sessionId,
@@ -123,15 +161,13 @@ export function createAnthropicPayloadLogger(params: {
 
   const record = (event: PayloadLogEvent) => {
     const line = safeJsonStringify(event);
-    if (!line) {
-      return;
-    }
+    if (!line) return;
     writer.write(`${line}\n`);
   };
 
   const wrapStreamFn: AnthropicPayloadLogger["wrapStreamFn"] = (streamFn) => {
     const wrapped: StreamFn = (model, context, options) => {
-      if (!isAnthropicModel(model)) {
+      if (!isAnthropicModel(model as Model<Api>)) {
         return streamFn(model, context, options);
       }
       const nextOnPayload = (payload: unknown) => {
@@ -152,16 +188,19 @@ export function createAnthropicPayloadLogger(params: {
     return wrapped;
   };
 
-  const recordUsage: AnthropicPayloadLogger["recordUsage"] = (messages, error) => {
-    const usage = findLastAssistantUsage(messages);
-    const errorMessage = formatError(error);
+  const recordUsage: AnthropicPayloadLogger["recordUsage"] = (
+    messages,
+    error,
+    baselineMessageCount,
+  ) => {
+    const usage = findLastAssistantUsage(messages, baselineMessageCount ?? 0);
     if (!usage) {
-      if (errorMessage) {
+      if (error) {
         record({
           ...base,
           ts: new Date().toISOString(),
           stage: "usage",
-          error: errorMessage,
+          error: formatErrorMessage(error),
         });
       }
       return;
@@ -171,7 +210,7 @@ export function createAnthropicPayloadLogger(params: {
       ts: new Date().toISOString(),
       stage: "usage",
       usage,
-      error: errorMessage,
+      error: error ? formatErrorMessage(error) : undefined,
     });
     log.info("anthropic usage", {
       runId: params.runId,
@@ -180,6 +219,6 @@ export function createAnthropicPayloadLogger(params: {
     });
   };
 
-  log.info("anthropic payload logger enabled", { filePath: writer.filePath });
-  return { enabled: true, wrapStreamFn, recordUsage };
+  log.info("anthropic payload logger enabled", { filePath: cfg.filePath });
+  return { enabled: true, filePath: cfg.filePath, wrapStreamFn, recordUsage };
 }
